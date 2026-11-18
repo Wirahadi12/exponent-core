@@ -95,7 +95,7 @@ jobs:
 
       - name: Start local validator (clone Metaplex Token Metadata program)
         run: |
-          nohup solana-test-validator --reset --clone metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s --quiet > validator.log 2>&1 &
+          nohup solana-test-validator --reset --url https://api.mainnet-beta.solana.com --clone metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s --quiet > validator.log 2>&1 &
           echo $! > validator.pid
           for i in $(seq 1 60); do
             if solana cluster-version --url http://127.0.0.1:8899 >/dev/null 2>&1; then echo "validator up after ${i}x2s"; break; fi
