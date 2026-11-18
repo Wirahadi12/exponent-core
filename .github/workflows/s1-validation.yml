@@ -1,0 +1,169 @@
+name: S-1 validation (Exponent Core, localnet)
+
+# Runs the S-1 end-to-end Anchor test (init market -> drain LP supply to
+# zero -> deposit_liquidity with min_lp_out=0) plus a reproducible-build
+# hash comparison against the deployed program.
+#
+# Triggered by pushes to main. The results step writes s1-results.md and
+# pushes it back to the repo ([skip ci] so it does not re-trigger).
+# The fork is public, so GitHub Actions minutes are free/unlimited.
+#
+# Toolchain pinned by the repo: Solana CLI 4.0.0, Anchor 0.31.1,
+# platform-tools v1.55 (via workspace metadata).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  s1-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Solana CLI 4.0.0 (fallback stable)
+        run: |
+          sh -c "$(curl -sSfL https://release.solana.com/v4.0.0/install)" \
+            || sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          solana --version || true
+          solana-keygen --version || true
+
+      - name: Install Anchor 0.31.1 via avm
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          export PATH="$HOME/.cargo/bin:$HOME/.avm/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+          avm install 0.31.1
+          avm use 0.31.1
+          anchor --version
+
+      - name: Install JS dependencies
+        run: |
+          yarn --version || (corepack enable && yarn --version)
+          yarn install
+
+      - name: Create test wallet
+        run: |
+          solana-keygen new --no-bip39-passphrase -o testkp.json
+          solana config set --url http://127.0.0.1:8899 --keypair testkp.json
+
+      # --- Reproducible build FIRST, on the pristine checkout, so the
+      # compiled program keeps the original (mainnet) declare_ids and the
+      # .so is comparable to the deployed binary. anchor keys sync (below)
+      # rewrites the ids for the localnet test build, so this must run
+      # before it. Best effort: a mismatch is reported, not fatal.
+      - name: Reproducible build (pristine source)
+        run: |
+          cargo build-sbf --manifest-path programs/exponent_core/Cargo.toml 2>&1 | tee build-repro.log
+          ls -la target/deploy/exponent_core.so
+          sha256sum target/deploy/exponent_core.so | tee build-hash.txt
+          stat -c%s target/deploy/exponent_core.so > build-size.txt
+          DEPLOYED=dd2b8426f820ef010b2a27564c89aa38a62422183ccb45197b5377d295e8d938
+          BUILT=$(cut -d' ' -f1 build-hash.txt)
+          if [ "$BUILT" = "$DEPLOYED" ]; then echo "MATCH" > build-verdict.txt; else echo "MISMATCH" > build-verdict.txt; fi
+          echo "deployed=$DEPLOYED built=$BUILT verdict=$(cat build-verdict.txt) size=$(cat build-size.txt) (deployed 2023961)"
+
+      - name: Build + sync program IDs for localnet
+        run: |
+          anchor build 2>&1 | tee build-anchor-1.log
+          anchor keys sync 2>&1 | tee keys-sync.log || true
+          anchor build 2>&1 | tee build-anchor-2.log
+          cat target/deploy/exponent_core-keypair.json >/dev/null && echo "core keypair ok"
+          cat target/deploy/exponent_admin-keypair.json >/dev/null && echo "admin keypair ok"
+
+      - name: Build + deploy mock SY program
+        run: |
+          cp programs/mock_sy/mock_sy-keypair.json target/deploy/mock_sy-keypair.json
+          cargo build-sbf --manifest-path programs/mock_sy/Cargo.toml 2>&1 | tee build-mock.log
+          ls -la target/deploy/mock_sy.so
+
+      - name: Start local validator (clone Metaplex Token Metadata program)
+        run: |
+          nohup solana-test-validator --reset --clone metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s --quiet > validator.log 2>&1 &
+          echo $! > validator.pid
+          for i in $(seq 1 60); do
+            if solana cluster-version --url http://127.0.0.1:8899 >/dev/null 2>&1; then echo "validator up after ${i}x2s"; break; fi
+            sleep 2
+          done
+          solana cluster-version --url http://127.0.0.1:8899
+          solana airdrop 10 --url http://127.0.0.1:8899
+
+      - name: Deploy mock SY program
+        run: |
+          solana program deploy --program-id programs/mock_sy/mock_sy-keypair.json target/deploy/mock_sy.so --url http://127.0.0.1:8899 2>&1 | tee deploy-mock.log
+
+      - name: Run S-1 Anchor test
+        run: |
+          anchor test --skip-local-validator --skip-build 2>&1 | tee anchor-test.log
+
+      - name: Write results + push back to repo
+        if: always()
+        run: |
+          {
+            echo "# S-1 validation results"
+            echo
+            echo "- Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- Solana CLI: $(solana --version 2>/dev/null || echo n/a)"
+            echo "- Anchor CLI: $(anchor --version 2>/dev/null || echo n/a)"
+            echo
+            echo "## Reproducible build (exponent_core.so vs deployed)"
+            echo "- Deployed sha256: dd2b8426f820ef010b2a27564c89aa38a62422183ccb45197b5377d295e8d938 (2,023,961 bytes)"
+            echo "- Built sha256: $(cut -d' ' -f1 build-hash.txt 2>/dev/null || echo n/a)"
+            echo "- Built size: $(cat build-size.txt 2>/dev/null || echo n/a) bytes"
+            echo "- Verdict: $(cat build-verdict.txt 2>/dev/null || echo n/a)"
+            echo
+            echo "## Anchor test (S-1 end-to-end)"
+            echo '```'
+            grep -A 25 "S-1 VERDICT" anchor-test.log 2>/dev/null || echo "(no S-1 VERDICT block in log)"
+            echo '```'
+            echo
+            echo "### mocha summary"
+            echo '```'
+            grep -E "passing|failing|pending" anchor-test.log 2>/dev/null | tail -5 || echo "(no summary found)"
+            echo '```'
+            echo
+            echo "### tail of anchor-test.log (last 120 lines)"
+            echo '```'
+            tail -n 120 anchor-test.log 2>/dev/null || echo "(no log)"
+            echo '```'
+          } > s1-results.md
+          cat s1-results.md
+          git config user.name "s1-validation-bot"
+          git config user.email "s1-validation-bot@users.noreply.github.com"
+          git add s1-results.md
+          git commit -m "S-1 validation results [skip ci]" || echo "nothing to commit"
+          git push origin HEAD:main || echo "PUSH FAILED - results only in workflow log/artifacts"
+
+      - name: Upload logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s1-logs
+          path: |
+            anchor-test.log
+            build-repro.log
+            build-anchor-1.log
+            build-anchor-2.log
+            build-mock.log
+            deploy-mock.log
+            keys-sync.log
+            validator.log
+            s1-results.md
