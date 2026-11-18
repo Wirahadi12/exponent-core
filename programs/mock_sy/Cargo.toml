@@ -1,0 +1,15 @@
+[package]
+name = "mock_sy"
+version = "0.1.0"
+description = "Mock SY program for the Exponent S-1 end-to-end test (localnet only, NOT part of Exponent)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mock_sy"
+
+[dependencies]
+solana-program = "2"
+borsh = "0.10"
+sy_common = { path = "../../libraries/sy_common" }
+precise_number = { path = "../../libraries/precise_number" }
