@@ -110,7 +110,9 @@ jobs:
 
       - name: Run S-1 Anchor test
         run: |
+          set -o pipefail
           anchor test --skip-local-validator --skip-build 2>&1 | tee anchor-test.log
+          echo "anchor test exit: ${PIPESTATUS[0]}" | tee -a anchor-test.log
 
       - name: Write results + push back to repo
         if: always()
